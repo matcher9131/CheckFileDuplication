@@ -1,0 +1,7 @@
+{
+  "profiles": {
+    "CheckFileDuplication": {
+      "commandName": "Project"
+    }
+  }
+}
