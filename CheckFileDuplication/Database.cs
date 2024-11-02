@@ -1,106 +1,107 @@
 ﻿using Microsoft.Data.Sqlite;
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 
 namespace CheckFileDuplication
 {
-    internal class Database : IDisposable
+    internal static class Database
     {
+        private const string ConnectionString = "Data Source=CheckFileDuplication.db";
         private const string TableName = "file";
+        private const string ColumnDirectory = "directory";
+        private const string ColumnFilename = "filename";
+        private const string ColumnHash = "hash";
+        private const string ColumnLastModified = "last_modified";
 
-        private readonly SqliteConnection connection;
-
-        public Database()
+        static Database()
         {
-            this.connection = new SqliteConnection("Data Source=CheckFileDuplication.db");
-            this.Initialize();
-        }
-
-        private void Initialize()
-        {
-            this.connection.Open();
-            using var createTableCommand = this.connection.CreateCommand();
+            using var connection = new SqliteConnection(ConnectionString);
+            connection.Open();
+            using var createTableCommand = connection.CreateCommand();
             createTableCommand.CommandText = $@"
                 CREATE TABLE IF NOT EXISTS {TableName} (
-                    path    BLOB NOT NULL PRIMARY KEY,
-                    hash    BLOB NOT NULL,
-                    date    TEXT NOT NULL
+                    {ColumnDirectory}       BLOB NOT NULL,
+                    {ColumnFilename}        TEXT NOT NULL,
+                    {ColumnHash}            BLOB NOT NULL,
+                    {ColumnLastModified}    TEXT NOT NULL,
+                    PRIMARY KEY({ColumnDirectory}, {ColumnFilename})
                 );
             ";
             createTableCommand.ExecuteNonQuery();
         }
 
-        public byte[] GetHashOrUpdate(string filePath)
+        /// <summary>
+        /// 指定したディレクトリ内の全てのファイルに関してデータベースに保存されているハッシュと更新日時を取得する
+        /// </summary>
+        /// <param name="directoryPath">対象となるディレクトリのパス</param>
+        /// <returns>ファイル名をキー、ハッシュと更新日時のタプルを値とする辞書</returns>
+        public static Dictionary<string, (byte[] hash, DateTime lastWriteTime)> GetFileHashes(string directoryPath)
         {
-            var pathHash = SHA256.HashData(Encoding.UTF8.GetBytes(filePath));
-            using var selectCommand = this.connection.CreateCommand();
-            selectCommand.CommandText = $"SELECT hash, date FROM {TableName} WHERE path = $path;";
-            selectCommand.Parameters.AddWithValue("$path", pathHash);
+            var directoryHash = SHA256.HashData(Encoding.UTF8.GetBytes(directoryPath));
+            using var connection = new SqliteConnection(ConnectionString);
+            connection.Open();
+            using var selectCommand = connection.CreateCommand();
+            selectCommand.CommandText = $@"SELECT {ColumnFilename}, {ColumnHash}, {ColumnLastModified} FROM {TableName} WHERE {ColumnDirectory} = @directoryHash;";
+            selectCommand.Parameters.AddWithValue("@directoryHash", directoryHash);
             using var reader = selectCommand.ExecuteReader();
-            if (reader.HasRows)
+            Dictionary<string, (byte[] hash, DateTime lastWriteTime)> dic = new();
+            while (reader.Read())
             {
-                reader.Read();
-                var hash = reader.GetFieldValue<byte[]>(0);
-                var date = reader.GetDateTime(1);
-                var lastWriteTime = File.GetLastWriteTime(filePath);
-                if (lastWriteTime > date)
-                {
-                    var newFileHash = HashUtil.GetFileHash(filePath);
-                    if (newFileHash.Length == 0) return Array.Empty<byte>();
-                    using var updateCommand = this.connection.CreateCommand();
-                    updateCommand.CommandText = $"UPDATE {TableName} SET hash = $hash, date = $date WHERE path = $path;";
-                    updateCommand.Parameters.AddWithValue("$hash", newFileHash);
-                    updateCommand.Parameters.AddWithValue("$date", lastWriteTime);
-                    updateCommand.Parameters.AddWithValue("$path", pathHash);
-                    updateCommand.ExecuteNonQuery();
-                    Console.WriteLine($"[Database] Updated: {Path.GetFileName(filePath)}");
-                    return newFileHash;
-                }
-                else
-                {
-                    return hash;
-                }
+                var filename = reader.GetString(0);
+                var hash = reader.GetFieldValue<byte[]>(1);
+                var lastWriteTime = reader.GetDateTime(2);
+                dic[filename] = (hash, lastWriteTime);
             }
-            else
-            {
-                var newFileHash = HashUtil.GetFileHash(filePath);
-                if (newFileHash.Length == 0) return Array.Empty<byte>();
-                var lastWriteTime = File.GetLastWriteTime(filePath);
-                using var insertCommand = this.connection.CreateCommand();
-                insertCommand.CommandText = $"INSERT INTO {TableName} VALUES($path, $hash, $date);";
-                insertCommand.Parameters.AddWithValue("$path", pathHash);
-                insertCommand.Parameters.AddWithValue("$hash", newFileHash);
-                insertCommand.Parameters.AddWithValue("$date", lastWriteTime);
-                Console.WriteLine($"[Database] Inserted: {Path.GetFileName(filePath)}");
-                return newFileHash;
-            }
+            return dic;
         }
 
-        #region IDisposable
-        private bool disposedValue;
-
-        protected virtual void Dispose(bool disposing)
+        /// <summary>
+        /// データベースに存在するファイルのハッシュと更新日時を更新する
+        /// </summary>
+        /// <param name="directoryPath">対象となるディレクトリのパス</param>
+        /// <param name="dic">対象となるファイル名をキー、ハッシュと更新日時のタプルを値とする辞書</param>
+        public static void Update(string directoryPath, ConcurrentDictionary<string, (byte[] hash, DateTime lastWriteTime)> dic)
         {
-            if (!disposedValue)
+            var directoryHash = SHA256.HashData(Encoding.UTF8.GetBytes(directoryPath));
+            using var connection = new SqliteConnection(ConnectionString);
+            connection.Open();
+            using var transaction = connection.BeginTransaction();
+            foreach (var (filename, (hash, lastWriteTime)) in dic)
             {
-                if (disposing)
-                {
-                    // TODO: マネージド状態を破棄します (マネージド オブジェクト)
-                    this.connection.Dispose();
-                }
-
-                // TODO: アンマネージド リソース (アンマネージド オブジェクト) を解放し、ファイナライザーをオーバーライドします
-                // TODO: 大きなフィールドを null に設定します
-                disposedValue = true;
+                using var updateCommand = connection.CreateCommand();
+                updateCommand.CommandText = $@"UPDATE {TableName} SET {ColumnHash} = @hash, {ColumnLastModified} = @lastWriteTime WHERE {ColumnDirectory} = @directoryHash AND {ColumnFilename} = @filename;";
+                updateCommand.Parameters.AddWithValue("@hash", hash);
+                updateCommand.Parameters.AddWithValue("@lastWriteTime", lastWriteTime);
+                updateCommand.Parameters.AddWithValue("@directoryHash", directoryHash);
+                updateCommand.Parameters.AddWithValue("@filename", filename);
+                updateCommand.ExecuteNonQuery();
             }
+            transaction.Commit();
         }
 
-        public void Dispose()
+        /// <summary>
+        /// データベースにファイルのハッシュと更新日時を追加する
+        /// </summary>
+        /// <param name="directoryPath">対象となるディレクトリのパス</param>
+        /// <param name="dic">対象となるファイル名をキー、ハッシュと更新日時のタプルを値とする辞書</param>
+        public static void Insert(string directoryPath, ConcurrentDictionary<string, (byte[] hash, DateTime lastWriteTime)> dic)
         {
-            // このコードを変更しないでください。クリーンアップ コードを 'Dispose(bool disposing)' メソッドに記述します
-            Dispose(disposing: true);
-            GC.SuppressFinalize(this);
+            var directoryHash = SHA256.HashData(Encoding.UTF8.GetBytes(directoryPath));
+            using var connection = new SqliteConnection(ConnectionString);
+            connection.Open();
+            using var transaction = connection.BeginTransaction();
+            foreach (var (filename, (hash, lastWriteTime)) in dic)
+            {
+                using var insertCommand = connection.CreateCommand();
+                insertCommand.CommandText = $@"INSERT INTO {TableName} VALUES(@directoryHash, @filename, @hash, @lastWriteTime);";
+                insertCommand.Parameters.AddWithValue("@directoryHash", directoryHash);
+                insertCommand.Parameters.AddWithValue("@filename", filename);
+                insertCommand.Parameters.AddWithValue("@hash", hash);
+                insertCommand.Parameters.AddWithValue("@lastWriteTime", lastWriteTime);
+                insertCommand.ExecuteNonQuery();
+            }
+            transaction.Commit();
         }
-        #endregion
     }
 }
